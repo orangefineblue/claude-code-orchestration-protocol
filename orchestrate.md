@@ -79,6 +79,81 @@ NO RE-READS: Once read, NEVER re-read. WHY: doubles token cost for zero new info
 TRACKING: After each summary, update plan file immediately (check subtask, note verdict, record paths). WHY: progressive documentation prevents context rot.
 </agent_output_discipline>
 
+<anti_polling_rule>
+ZERO-POLL WAITING [MANDATORY — HARDEST RULE IN THIS PROTOCOL]
+
+NEVER poll agent progress. NEVER call TaskOutput while an agent is running. NEVER use Bash to tail/read agent output files. NEVER use sleep+check loops.
+
+WHY THIS RULE EXISTS: Every poll of TaskOutput returns the FULL agent transcript (often 50-150K tokens) into the orchestrator's context. A single poll can consume 10-20% of the context window. Multiple polls killed a session at 64% tokens with zero useful work done.
+
+WHAT TO DO INSTEAD:
+1. Launch agent with run_in_background=true
+2. Tell the user: "Agent launched. Will process result when done."
+3. DO NOTHING. Zero tool calls. Zero bash commands. The system sends automatic notifications when agents complete.
+4. When the completion notification arrives, read ONLY the agent's summary file (the one specified in the agent prompt), NOT the TaskOutput.
+5. Process the summary and launch the next agent.
+
+IF THE USER ASKS FOR STATUS: Say "Agent is still running. The system will notify me when it completes. No action needed from either of us."
+
+IF AGENT SEEMS STUCK (>15 minutes): Use ONE minimal bash command: `wc -l <output_file_path> 2>/dev/null || echo "NOT YET"`. This costs ~20 tokens vs 100K+ for TaskOutput. Never use TaskOutput for status checks.
+
+HARD BAN LIST:
+- TaskOutput with block=false (returns full transcript)
+- TaskOutput with block=true (blocks AND returns full transcript)
+- Bash: tail/cat/head on agent output files
+- Bash: sleep + any check pattern
+- Reading /private/tmp/claude-501/ files directly
+</anti_polling_rule>
+
+<large_file_strategy>
+LARGE FILE WRITES [MANDATORY FOR FILES >1,000 LINES]
+
+The Write tool and agent output have a 32K token limit. Files >1,000 lines (~25K tokens) WILL exceed this limit and fail.
+
+STRATEGY FOR LARGE FILES:
+1. Agent writes file using Bash + Python heredoc/script, NOT the Write tool
+2. Agent breaks the file into sections and writes each section via Bash + Python append
+3. Example pattern:
+```
+python3 -c "
+content = '''[section content here]'''
+with open('output.md', 'a') as f:
+    f.write(content)
+"
+```
+4. Or use a Python script that the agent writes first, then executes
+
+AGENT PROMPT REQUIREMENT: When a task will produce >1,000 lines of output, the agent prompt MUST include:
+"WARNING: Output will exceed 1,000 lines. You MUST use Bash with Python to write the file, NOT the Write tool. The Write tool has a 32K token limit that will truncate your output. Write in sections using Python file append operations."
+
+WHY: Write tool failures are silent — the agent thinks it wrote the full file but only partial content was saved. Python file operations have no such limit.
+</large_file_strategy>
+
+<cascade_pipeline_design>
+CASCADE PATTERN [USE WHEN POSSIBLE]
+
+Instead of the orchestrator waiting for each agent and launching the next, design agents to chain when safe.
+
+PATTERN A — ORCHESTRATOR-DRIVEN (default):
+Orchestrator launches Agent 1 → waits for notification → reads summary → launches Agent 2 → ...
+Use when: next agent's prompt depends on previous agent's output (e.g., QC needs to know what was produced)
+
+PATTERN B — SELF-CHAINING:
+Agent 1 writes output AND launches Agent 2 as a sub-task before finishing.
+Use when: the chain is predetermined and Agent 2's prompt can be fully specified in advance.
+HOW: Include in Agent 1's prompt: "After completing your primary task, launch a Task agent with the following prompt: [full QC prompt]"
+CAUTION: Only chain 2 levels deep. Deeper chains risk context rot in the sub-agents.
+
+PATTERN C — PARALLEL INDEPENDENT:
+Launch Agents 1, 2, 3 simultaneously (all independent).
+Wait for all completion notifications.
+Read all summaries.
+Launch dependent Agent 4.
+ZERO polling during the parallel wait.
+
+CHOOSING: If all agent prompts can be written at plan time (no dependency on previous output content), use Pattern B or C. Otherwise, use Pattern A with zero-poll waiting.
+</cascade_pipeline_design>
+
 <token_and_handover>
 TOKEN AWARENESS (supplements existing CLAUDE.md thresholds - follow whichever is stricter):
 - At 60%: WARN the user. Finish current wave. No new waves. WHY: routing-only orchestrators barely consume tokens; 60% means the task is very large.
